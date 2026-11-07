@@ -1,0 +1,183 @@
+name: CI/CD Laravel - Liberacion a preproduccion
+
+on:
+  push:
+    branches: [ main ]
+    tags: [ 'v*.*.*' ]
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  integracion-continua:
+    name: Integracion continua
+    runs-on: ubuntu-latest
+    steps:
+      - name: Obtener codigo
+        uses: actions/checkout@v4
+
+      - name: Configurar PHP
+        uses: shivammathur/setup-php@v2
+        with:
+          php-version: '8.3'
+          extensions: mbstring, xml, ctype, json, bcmath, fileinfo, tokenizer, pdo_sqlite, sqlite3
+          coverage: none
+
+      - name: Configurar Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+
+      - name: Instalar dependencias de Composer
+        run: composer install --prefer-dist --no-progress --no-interaction
+
+      - name: Compilar recursos de frontend
+        run: |
+          npm ci
+          npm run build
+
+      - name: Preparar entorno de pruebas
+        run: |
+          cp .env.example .env
+          php artisan key:generate
+
+      - name: Ejecutar pruebas automatizadas
+        run: php artisan test
+
+  liberacion:
+    name: Generar artefacto de liberacion
+    needs: integracion-continua
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - name: Obtener codigo
+        uses: actions/checkout@v4
+
+      - name: Configurar PHP
+        uses: shivammathur/setup-php@v2
+        with:
+          php-version: '8.3'
+          extensions: mbstring, xml, ctype, json, bcmath, fileinfo, tokenizer
+          coverage: none
+
+      - name: Configurar Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+
+      - name: Instalar dependencias de produccion
+        run: composer install --no-dev --prefer-dist --optimize-autoloader --no-interaction
+
+      - name: Compilar recursos de frontend
+        run: |
+          npm ci
+          npm run build
+
+      - name: Definir version
+        id: version
+        run: |
+          if [[ "${GITHUB_REF}" == refs/tags/v* ]]; then
+            VERSION="${GITHUB_REF_NAME}"
+          else
+            VERSION="v0.0.0-build.${GITHUB_RUN_NUMBER}-${GITHUB_SHA::7}"
+          fi
+          echo "${VERSION}" > VERSION
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+
+      - name: Generar artefacto de liberacion
+        run: |
+          mkdir -p dist
+          tar --exclude='./.git' \
+              --exclude='./.github' \
+              --exclude='./.env' \
+              --exclude='./.env.backup' \
+              --exclude='./.env.production' \
+              --exclude='./node_modules' \
+              --exclude='./tests' \
+              --exclude='./dist' \
+              --exclude='./storage/logs/*' \
+              --exclude='./storage/framework/cache/data/*' \
+              --exclude='./storage/framework/sessions/*' \
+              --exclude='./storage/framework/views/*' \
+              -czf "dist/laravel-release-${{ steps.version.outputs.version }}.tar.gz" .
+          cd dist && sha256sum *.tar.gz > SHA256SUMS
+
+      - name: Verificar el artefacto
+        run: bash scripts/verificar-artefacto.sh "dist/laravel-release-${{ steps.version.outputs.version }}.tar.gz"
+
+      - name: Publicar artefacto
+        uses: actions/upload-artifact@v4
+        with:
+          name: laravel-release-${{ steps.version.outputs.version }}
+          path: dist/
+          if-no-files-found: error
+          retention-days: 7
+
+  validacion-preproduccion:
+    name: Validar artefacto en entorno de pruebas
+    needs: liberacion
+    runs-on: ubuntu-latest
+    environment: preproduccion
+    steps:
+      - name: Obtener scripts
+        uses: actions/checkout@v4
+        with:
+          sparse-checkout: scripts
+
+      - name: Configurar PHP
+        uses: shivammathur/setup-php@v2
+        with:
+          php-version: '8.3'
+          extensions: mbstring, xml, ctype, json, bcmath, fileinfo, tokenizer, pdo_sqlite, sqlite3
+          coverage: none
+
+      - name: Descargar artefacto
+        uses: actions/download-artifact@v4
+        with:
+          name: laravel-release-${{ needs.liberacion.outputs.version }}
+          path: entrega
+
+      - name: Instalar y probar en entorno de pruebas
+        run: bash scripts/probar-artefacto.sh entrega "${{ needs.liberacion.outputs.version }}"
+
+  entrega-preproduccion:
+    name: Entregar a preproduccion
+    needs: [ liberacion, validacion-preproduccion ]
+    if: ${{ vars.DEPLOY_PREPROD == 'true' }}
+    runs-on: ubuntu-latest
+    environment: preproduccion
+    steps:
+      - name: Obtener scripts
+        uses: actions/checkout@v4
+        with:
+          sparse-checkout: scripts
+
+      - name: Descargar artefacto
+        uses: actions/download-artifact@v4
+        with:
+          name: laravel-release-${{ needs.liberacion.outputs.version }}
+          path: entrega
+
+      - name: Configurar acceso SSH
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.PREPROD_SSH_KEY }}" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          ssh-keyscan -H "${{ secrets.PREPROD_HOST }}" >> ~/.ssh/known_hosts
+
+      - name: Copiar artefacto y script al servidor
+        run: |
+          scp entrega/*.tar.gz scripts/desplegar-preprod.sh \
+            "${{ secrets.PREPROD_USER }}@${{ secrets.PREPROD_HOST }}:/tmp/"
+
+      - name: Desplegar en preproduccion
+        run: |
+          ssh "${{ secrets.PREPROD_USER }}@${{ secrets.PREPROD_HOST }}" \
+            "bash /tmp/desplegar-preprod.sh /tmp/laravel-release-${{ needs.liberacion.outputs.version }}.tar.gz ${{ needs.liberacion.outputs.version }}"
